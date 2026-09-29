@@ -15,8 +15,9 @@ Propósito:
     Soporta etiquetado dinámico de origen de anotaciones ('source_type': 'PDF_NATIVE' 
     o 'WEB_LEAN_LIBRARY'), deduplicación inteligente para ítems híbridos, filtrado 
     por proyecto vía '--projects', extracción geométrica incremental por paso de scroll,
-    reintento focalizado de PDFs fallidos vía '--retry-failed-pdfs' y generación de
-    reportes analíticos independientes a partir de un archivo JSON vía '-r / --report'.
+    reintento focalizado de PDFs fallidos vía '--retry-failed-pdfs', normalización
+    de fechas al estándar ISO 8601 (YYYY-MM-DD, YYYY-MM, YYYY) para compatibilidad CSL/Zotero,
+    y generación de reportes analíticos independientes a partir de un archivo JSON vía '-r / --report'.
 """
 
 import os
@@ -276,7 +277,7 @@ def generate_standalone_report(filepath: Union[str, Path]) -> None:
     print("--------------------------------------------------------------------------------")
 
     if not items_available:
-        print("  ⚠️ La información de notas no se puede calcular por ausencia del campo 'items'.")
+        print("  ⚠️️ La información de notas no se puede calcular por ausencia del campo 'items'.")
     else:
         total_notes_count = 0
         native_pdf_notes_count = 0
@@ -508,8 +509,123 @@ def extract_creators_from_reference(ref_data: Dict[str, Any], zotero_type: str =
     return creators
 
 
+def _format_date_parts(parts: List[Any]) -> str:
+    """Formatea una lista de componentes de fecha [YYYY, MM, DD] a la norma ISO 8601."""
+    try:
+        clean_parts = []
+        for p in parts:
+            if isinstance(p, (int, float)):
+                clean_parts.append(int(p))
+            elif isinstance(p, str) and p.strip().isdigit():
+                clean_parts.append(int(p.strip()))
+
+        if not clean_parts:
+            return ""
+
+        year = clean_parts[0]
+        if year < 100:
+            year += 2000
+        elif year < 1000 or year > 2100:
+            return ""
+
+        res = f"{year:04d}"
+        if len(clean_parts) >= 2:
+            month = clean_parts[1]
+            if 1 <= month <= 12:
+                res += f"-{month:02d}"
+                if len(clean_parts) >= 3:
+                    day = clean_parts[2]
+                    if 1 <= day <= 31:
+                        res += f"-{day:02d}"
+        return res
+    except Exception:
+        return ""
+
+
+def parse_iso_date(raw_date: Any) -> str:
+    """
+    Normaliza datos de fecha polimórficos provenientes de Sciwheel / CSL-JSON
+    al estándar internacional ISO 8601 (YYYY-MM-DD, YYYY-MM, o YYYY).
+    """
+    if not raw_date:
+        return ""
+
+    # 1. Si es un diccionario CSL-JSON p.ej: {'date-parts': [[2010, 8, 23]]} o {year: 2010, month: 8}
+    if isinstance(raw_date, dict):
+        date_parts = raw_date.get("date-parts") or raw_date.get("date_parts")
+        if date_parts and isinstance(date_parts, list):
+            if len(date_parts) > 0 and isinstance(date_parts[0], list):
+                parts = date_parts[0]
+            else:
+                parts = date_parts
+            return _format_date_parts(parts)
+
+        y = raw_date.get("year") or raw_date.get("y")
+        m = raw_date.get("month") or raw_date.get("m")
+        d = raw_date.get("day") or raw_date.get("d")
+        if y:
+            parts = [y]
+            if m:
+                parts.append(m)
+                if d:
+                    parts.append(d)
+            return _format_date_parts(parts)
+
+    # 2. Si es una lista directa de componentes de fecha p.ej: [2010, 8, 23]
+    if isinstance(raw_date, list):
+        if len(raw_date) > 0 and isinstance(raw_date[0], list):
+            return _format_date_parts(raw_date[0])
+        return _format_date_parts(raw_date)
+
+    # 3. Si es un número (Año simple ej. 2010)
+    if isinstance(raw_date, (int, float)):
+        val = int(raw_date)
+        if 1000 <= val <= 2100:
+            return str(val)
+
+    # 4. Si es una cadena de texto
+    date_str = str(raw_date).strip()
+    if not date_str:
+        return ""
+
+    # Si la cadena contiene la estructura JSON / dict CSL serializada en texto (ej: "{'date-parts': [[2010, 8, 23]]}")
+    if "date-parts" in date_str or "date_parts" in date_str:
+        try:
+            json_friendly = date_str.replace("'", '"')
+            parsed_dict = json.loads(json_friendly)
+            return parse_iso_date(parsed_dict)
+        except Exception:
+            nums = re.findall(r'\b\d+\b', date_str)
+            if nums:
+                return _format_date_parts(nums)
+
+    # Extraer patrón ISO YYYY-MM-DD, YYYY-MM o YYYY usando Expresiones Regulares
+    iso_match = re.search(r'(\b\d{4}\b)(?:[-/.](\d{1,2}))?(?:[-/.](\d{1,2}))?', date_str)
+    if iso_match:
+        y, m, d = iso_match.groups()
+        parts = [int(y)]
+        if m:
+            parts.append(int(m))
+            if d:
+                parts.append(int(d))
+        return _format_date_parts(parts)
+
+    return ""
+
+
 def extract_zotero_fields(ref_data: Dict[str, Any]) -> Dict[str, str]:
     fields: Dict[str, str] = {}
+
+    # Búsqueda polimórfica de la fecha en CSL-JSON o API de Sciwheel
+    raw_date = (
+        ref_data.get("issued") or
+        ref_data.get("publishedDate") or
+        ref_data.get("publishedYear") or
+        ref_data.get("published-date") or
+        ref_data.get("date")
+    )
+    normalized_date = parse_iso_date(raw_date)
+
     mapping = {
         "publicationTitle": ref_data.get("journalName") or ref_data.get("journalAbbreviation") or ref_data.get("container-title"),
         "bookTitle": ref_data.get("bookTitle"),
@@ -517,7 +633,7 @@ def extract_zotero_fields(ref_data: Dict[str, Any]) -> Dict[str, str]:
         "volume": ref_data.get("volume"),
         "issue": ref_data.get("issue") or ref_data.get("number"),
         "pages": ref_data.get("pagination") or ref_data.get("page") or ref_data.get("pages"),
-        "date": str(ref_data.get("publishedYear") or ref_data.get("publishedDate") or ref_data.get("issued") or ""),
+        "date": normalized_date,
         "DOI": ref_data.get("DOI") or ref_data.get("doi"),
         "abstractNote": ref_data.get("abstract") or ref_data.get("abstractText"),
         "publisher": ref_data.get("publisher"),
@@ -1238,6 +1354,16 @@ class SciwheelDataExtractor:
                                 att["path"] = None
                             attachments_list.append(att)
 
+                    # Sanear campos de metadatos preexistentes en JSON acumulador
+                    fields_dict = item.get("fields", {})
+                    if isinstance(fields_dict, dict) and "date" in fields_dict:
+                        raw_date_val = fields_dict.get("date")
+                        norm_date = parse_iso_date(raw_date_val)
+                        if norm_date:
+                            fields_dict["date"] = norm_date
+                        elif raw_date_val and ("date-parts" in str(raw_date_val) or "{" in str(raw_date_val)):
+                            del fields_dict["date"]
+
                     self.global_references[sci_id] = {
                         "sciwheel_id": sci_id,
                         "sciwheel_uuid": item.get("sciwheel_uuid"),
@@ -1247,7 +1373,7 @@ class SciwheelDataExtractor:
                         "itemType": item.get("itemType", "journalArticle"),
                         "title": item.get("title", ""),
                         "creators": item.get("creators", []),
-                        "fields": item.get("fields", {}),
+                        "fields": fields_dict,
                         "collection_ids": collection_ids_set,
                         "tags": tags_set,
                         "notes": notes_list,
@@ -1900,7 +2026,7 @@ class SciwheelDataExtractor:
                                 self.logger.debug(f"\t 🔗 Enlace al PDF detectado en el DOM: {pdf_href}. Redirigiendo...")
                                 page.goto(pdf_href, wait_until="networkidle", timeout=self.args.playwright_timeout * 1000)
                         else:
-                            self.logger.warning(f"\t ⚠️ No se encontró botón/enlace 'PDF' en la vista del ítem {sci_id}.")
+                            self.logger.warning(f"\t ⚠️️ No se encontró botón/enlace 'PDF' en la vista del ítem {sci_id}.")
 
                     page.wait_for_selector(".page", timeout=15000)
 
