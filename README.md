@@ -4,7 +4,7 @@
 ![Package Manager](https://img.shields.io/badge/uv-supported-6f42c1.svg)
 ![Target](https://img.shields.io/badge/Zotero-10%2B%20Local%20API-red.svg)
 ![Automation](https://img.shields.io/badge/Playwright-DOM%20Extraction-green.svg)
-![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)
+![License](https://img.shields.io/badge/license-Apache-blue.svg)
 
 Suite de herramientas en Python diseñadas para migrar de forma integral y con **mínima pérdida de información** la biblioteca personal o compartida desde **Sciwheel** hacia **Zotero 10+** mediante la *Local Write API* oficial de Zotero (`http://127.0.0.1:23119/api/`).
 
