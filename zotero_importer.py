@@ -36,7 +36,6 @@ import logging
 import argparse
 import hashlib
 import colorsys
-import ast
 import mimetypes
 from pathlib import Path
 from datetime import datetime, timezone
@@ -68,6 +67,28 @@ KNOWN_ZOTERO_ITEM_TYPES = {
 def id_tag(sciwheel_id: str) -> str:
     """Tag único e idempotente para un ítem, a partir de su sciwheel_id."""
     return f"sciwheel-id:{sciwheel_id}"
+
+
+# Validación de entrada, no reparación: si 'date' trae la firma de un bug ya
+# corregido en el extractor (CSL-JSON crudo, ej. "{'date-parts': [[2010,8,23]]}"
+# en vez de "2010-08-23"), el importador se NIEGA a escribir ese valor en
+# Zotero -- no intenta reconstruir la fecha correcta (eso es trabajo del
+# extractor). Mismo criterio que ya se aplica a itemType/título/autores en
+# validate_items(): dato claramente inválido -> se excluye ese campo, no se
+# adivina. Sirve de red de seguridad si se reusa un manifest viejo.
+BROKEN_DATE_PATTERN = re.compile(r"date-parts", re.IGNORECASE)
+
+
+def sanitize_date_field(item: Dict[str, Any], logger: logging.Logger) -> None:
+    """Si fields.date trae la firma de CSL-JSON crudo, se descarta ese campo
+    (in-place) en vez de escribirlo en Zotero -- no se intenta reconstruir.
+    No invalida el ítem entero: perder solo la fecha no amerita excluir toda
+    la referencia."""
+    date_val = item.get("fields", {}).get("date")
+    if isinstance(date_val, str) and BROKEN_DATE_PATTERN.search(date_val):
+        logger.warning(f"\t ⚠️ Ítem {item.get('sciwheel_id')}: 'date' con CSL-JSON crudo "
+                        f"({date_val!r}) — se descarta ese campo, no se importa así.")
+        item["fields"]["date"] = ""
 
 
 ATT_TAG_PREFIX = "sciwheel-att:"
@@ -243,23 +264,15 @@ def fmt_mb(num_bytes: int) -> str:
 
 def normalize_item_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Defensa ante campos del manifest que Zotero interpretaría mal:
-      - date como dict de CSL stringificado ("{'date-parts': [[2024, 11, 22]]}")
-        -> "2024-11-22" (Zotero no parsea ese formato y dejaría la fecha vacía).
+    Validación de campos del manifest antes de escribirlos en Zotero —
+    NUNCA reconstruye ni infiere un valor (eso es trabajo del extractor);
+    solo se niega a escribir un campo que puede verificar como inválido:
       - url relativa ("/fulltext/doi/...") -> se descarta (no es una URL válida).
       - abstractNote con <br> -> saltos de línea.
-    La corrección de fondo corresponde al extractor; esto evita ensuciar
-    Zotero mientras tanto.
+    (El caso de 'date' con CSL-JSON crudo se descarta antes, en
+    sanitize_date_field() / validate_items() — acá no hace falta repetirlo.)
     """
     out = dict(fields)
-    date = out.get("date")
-    if isinstance(date, str) and "date-parts" in date:
-        try:
-            parts = ast.literal_eval(date)["date-parts"][0]
-            out["date"] = "-".join(f"{int(p):02d}" if i else f"{int(p):04d}"
-                                    for i, p in enumerate(parts))
-        except Exception:
-            out.pop("date", None)
     url = out.get("url")
     if isinstance(url, str) and url and not url.lower().startswith(("http://", "https://")):
         out.pop("url", None)
@@ -563,7 +576,7 @@ class ZoteroLocalClient:
                 "key": data.get("key"), "version": data.get("version"),
                 "tags": tags, "collections": data.get("collections", []),
                 "attachments": {}, "untagged_attachment_keys": [],
-                "child_note_hashes": set(),
+                "child_note_hashes": set(), "date": data.get("date", ""),
             }
             key_to_sciid[data.get("key")] = sciwheel_id
 
@@ -783,6 +796,7 @@ def validate_items(manifest: Dict[str, Any], logger: logging.Logger) -> Tuple[Li
                              "error_type": "InsufficientData",
                              "error_message": "Sin título ni autores."})
             continue
+        sanitize_date_field(item, logger)
         valid.append(item)
 
     if invalid:
